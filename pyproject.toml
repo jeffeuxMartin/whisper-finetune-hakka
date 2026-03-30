@@ -1,0 +1,17 @@
+[project]
+name = "whisper-finetune-hakka"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "datasets>=4.0.0",
+    "evaluate>=0.4.5",
+    "jiwer>=4.0.0",
+    "schedulefree>=1.4.1",
+    "soundfile>=0.13.1",
+    "torch>=2.8.0",
+    "torchcodec>=0.6.0",
+    "transformers[torch]>=4.55.0",
+    "wandb>=0.21.1",
+]
