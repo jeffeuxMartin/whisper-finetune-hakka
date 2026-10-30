@@ -228,14 +228,14 @@ def load_all_datasets(split):
                     split="train",
                 )
 
-                none_audio_dataset = dataset.filter(lambda x: x["audio"] is None)
-                if len(none_audio_dataset) > 0:
-                    print(
-                        f"Dataset {ds} with config {config_name} has {len(none_audio_dataset)} samples with no audio."
-                    )
-                    for sample in none_audio_dataset:
-                        print(f"id {sample['id']} no audio")
-                    dataset = dataset.filter(lambda x: x["audio"] is not None)
+                # none_audio_dataset = dataset.filter(lambda x: x["audio"] is None)
+                # if len(none_audio_dataset) > 0:
+                #     print(
+                #         f"Dataset {ds} with config {config_name} has {len(none_audio_dataset)} samples with no audio."
+                #     )
+                #     for sample in none_audio_dataset:
+                #         print(f"id {sample['id']} no audio")
+                #     dataset = dataset.filter(lambda x: x["audio"] is not None)
 
                 dataset = dataset.cast_column("audio", Audio(args.sampling_rate))
                 dataset = dataset.rename_column("hanzi", "sentence")
