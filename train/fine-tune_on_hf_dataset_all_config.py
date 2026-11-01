@@ -1,15 +1,25 @@
 import argparse
+import csv
+import json
+import math
+import os
 import re
 from dataclasses import dataclass
+from functools import lru_cache
+from pathlib import Path
 from typing import Any, Dict, List, Union
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 
 import torch
 from datasets import (
     Audio,
+    Dataset,
     DatasetDict,
+    Features,
+    Value,
     concatenate_datasets,
-    get_dataset_config_names,
-    get_dataset_split_names,
+    load_dataset_builder,
     load_dataset,
 )
 from transformers import (
@@ -122,21 +132,10 @@ parser.add_argument(
     help="Output directory for the checkpoints generated.",
 )
 parser.add_argument(
-    "--train_datasets",
+    "--dataset_config_csv",
     type=str,
-    nargs="+",
     required=True,
-    default=[],
-    help="List of datasets to be used for training.",
-)
-
-parser.add_argument(
-    "--eval_datasets",
-    type=str,
-    nargs="+",
-    required=True,
-    default=[],
-    help="List of datasets to be used for evaluation.",
+    help="CSV manifest defining train/eval datasets, source adapters and sampling.",
 )
 
 parser.add_argument(
@@ -146,16 +145,27 @@ parser.add_argument(
     default=1,
     help="Number of gradient accumulation steps.",
 )
+parser.add_argument(
+    "--logging_steps", type=int, default=500,
+    help="Log training loss every N optimizer steps (e.g., 1 for a Colab smoke test).",
+)
+parser.add_argument(
+    "--dataloader_num_workers", type=int, default=None,
+    help="PyTorch DataLoader workers; 0 is useful for Colab (default: 16).",
+)
+parser.add_argument(
+    "--report_to", choices=["wandb", "none"], default="wandb",
+    help="Trainer reporting backend (use 'none' for Colab without W&B).",
+)
 
 args = parser.parse_args()
 
 if args.train_strategy not in ["steps", "epoch"]:
     raise ValueError("The train strategy should be either steps and epoch.")
-
-if len(args.train_datasets) == 0:
-    raise ValueError("No train dataset has been passed")
-if len(args.eval_datasets) == 0:
-    raise ValueError("No evaluation dataset has been passed")
+if args.num_proc < 1 or args.logging_steps < 1:
+    raise ValueError("--num_proc and --logging_steps must be positive integers")
+if args.dataloader_num_workers is not None and args.dataloader_num_workers < 0:
+    raise ValueError("--dataloader_num_workers must be >= 0")
 
 print("\n\n+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++\n\n")
 print("ARGUMENTS OF INTEREST:")
@@ -209,7 +219,7 @@ if gradient_checkpointing:
 
 def remove_trailing_comma_and_add_dot(x):
     sentence = re.sub(r"，$", "", x["sentence"])
-    if sentence[-1] not in ["。", "？", "！"]:
+    if sentence and sentence[-1] not in ["。", "？", "！"]:
         sentence += "。"
     return {"sentence": sentence}
 
@@ -217,51 +227,211 @@ def remove_trailing_comma_and_add_dot(x):
 ############################        DATASET LOADING AND PREP        ##########################
 
 
-def load_all_datasets(split):
-    combined_dataset = []
-    if split == "train":
-        for i, ds in enumerate(args.train_datasets):
-            for config_name in get_dataset_config_names(ds):
-                dataset = load_dataset(
-                    ds,
-                    config_name,
-                    split="train",
-                )
+# One CSV controls both roles. HF and local_csv sources normalize to the same
+# Audio/sentence schema before the original filtering and Trainer code.
+DATASET_FEATURES = Features({"audio": Audio(decode=False), "sentence": Value("string")})
+MANIFEST = Path(os.path.expandvars(os.path.expanduser(args.dataset_config_csv))).resolve()
 
-                none_audio_dataset = dataset.filter(lambda x: x["audio"] is None)
-                if len(none_audio_dataset) > 0:
-                    print(
-                        f"Dataset {ds} with config {config_name} has {len(none_audio_dataset)} samples with no audio."
-                    )
-                    for sample in none_audio_dataset:
-                        print(f"id {sample['id']} no audio")
-                    dataset = dataset.filter(lambda x: x["audio"] is not None)
+with MANIFEST.open(newline="", encoding="utf-8-sig") as handle:
+    DATASET_SETTINGS = list(csv.DictReader(handle))
 
-                dataset = dataset.cast_column("audio", Audio(args.sampling_rate))
-                dataset = dataset.rename_column("hanzi", "sentence")
-                dataset = dataset.remove_columns(
-                    set(dataset.features.keys()) - set(["audio", "sentence"])
-                )
-                dataset = dataset.map(remove_trailing_comma_and_add_dot, num_proc=8)
-                combined_dataset.append(dataset)
-    elif split == "eval":
-        for i, ds in enumerate(args.eval_datasets):
-            for config_name in get_dataset_config_names(ds):
-                if "test" not in get_dataset_split_names(ds, config_name):
+REQUIRED_COLUMNS = {"role", "source_type", "path", "split", "sample_mode", "sample_value"}
+if not DATASET_SETTINGS:
+    raise ValueError(f"Empty dataset manifest: {MANIFEST}")
+if not REQUIRED_COLUMNS.issubset(DATASET_SETTINGS[0]):
+    raise ValueError(f"Missing manifest columns: {sorted(REQUIRED_COLUMNS - set(DATASET_SETTINGS[0]))}")
+
+
+def _enabled(cfg):
+    return (cfg.get("enabled") or "1").strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _local_path(value, base):
+    path = Path(os.path.expandvars(os.path.expanduser(value)))
+    return path if path.is_absolute() else base / path
+
+
+@lru_cache(maxsize=None)
+def _hf_size_table(repo):
+    """One small metadata request per HF repository, shared across configs/splits.
+
+    Dataset Viewer may report partial coverage; individual rows with a concrete
+    num_rows remain usable. Missing entries fall back to DatasetBuilder metadata.
+    """
+    url = "https://datasets-server.huggingface.co/size?" + urlencode({"dataset": repo})
+    token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    try:
+        with urlopen(Request(url, headers=headers), timeout=30) as response:
+            payload = json.load(response)
+        return {
+            (item["config"], item["split"]): int(item["num_rows"])
+            for item in payload.get("size", {}).get("splits", [])
+            if item.get("num_rows") is not None
+        }
+    except Exception as exc:
+        print(f"[metadata] /size unavailable for {repo}: {exc}", flush=True)
+        return {}
+
+
+@lru_cache(maxsize=None)
+def _hf_num_rows(repo, config, split):
+    # Avoid repeatedly resolving all Parquet shards solely to count examples.
+    count = _hf_size_table(repo).get((config, split))
+    if count is not None:
+        return count
+    try:
+        builder = load_dataset_builder(repo, config or None)
+        split_info = (builder.info.splits or {}).get(split)
+        if split_info is not None and split_info.num_examples is not None:
+            return int(split_info.num_examples)
+    except Exception as exc:
+        raise ValueError(
+            f"No row-count metadata for {repo}/{config}/{split}. "
+            "Set sample_mode=head and sample_value=25 in the CSV."
+        ) from exc
+    raise ValueError(
+        f"No row-count metadata for {repo}/{config}/{split}. "
+        "Set sample_mode=head and sample_value=25 in the CSV."
+    )
+
+
+def _sample_limit(cfg, count=None):
+    mode = (cfg["sample_mode"] or "all").strip().lower()
+    if mode == "all":
+        return None
+    if mode == "head":
+        n = int(cfg["sample_value"])
+        if n < 1:
+            raise ValueError(f"head sample_value must be positive: {cfg}")
+        return n
+    if mode == "ratio":
+        fraction = float(cfg["sample_value"])
+        if not 0 < fraction <= 1:
+            raise ValueError(f"ratio sample_value must be within (0, 1]: {cfg}")
+        if count is None:
+            count = _hf_num_rows(cfg["path"], cfg.get("config") or "", cfg["split"])
+        return min(count, max(3, math.ceil(count * fraction)))
+    raise ValueError(f"Unknown sample_mode={mode!r}: {cfg}")
+
+
+def _load_hf(cfg):
+    limit = _sample_limit(cfg)
+    audio_col = cfg.get("audio_col") or "audio"
+    text_col = cfg.get("text_col") or "sentence"
+    data = load_dataset(
+        cfg["path"], cfg.get("config") or None, split=cfg["split"],
+        streaming=limit is not None,
+    )
+    data = data.cast_column(audio_col, Audio(decode=False))
+    if audio_col != "audio":
+        data = data.rename_column(audio_col, "audio")
+    if text_col != "sentence":
+        data = data.rename_column(text_col, "sentence")
+    data = data.select_columns(["audio", "sentence"])
+    if limit is not None:
+        # Streaming avoids the full Hub download. Materialize only the selected
+        # records, as the original Seq2SeqTrainer expects an indexed Dataset.
+        data = Dataset.from_list(list(data.take(limit)), features=DATASET_FEATURES)
+    return data
+
+
+def _local_rows(cfg, read_content=True):
+    """Stream the index CSV; never decode audio while selecting rows."""
+    index_path = _local_path(cfg["path"], MANIFEST.parent)
+    root = index_path.parent
+    split_col = cfg.get("split_col") or ""
+    file_col = cfg.get("file_col") or ""
+    text_col = cfg.get("text_col") or ""
+    audio_col = cfg.get("audio_col") or ""
+    audio_template = cfg.get("audio_template") or ""
+    text_template = cfg.get("text_template") or ""
+    with index_path.open(newline="", encoding="utf-8-sig") as handle:
+        for row in csv.DictReader(handle):
+            if split_col and (row.get(split_col) or "").strip().casefold() != cfg["split"].strip().casefold():
+                continue
+            if not read_content:
+                yield None
+                continue
+            name = Path((row.get(file_col) or "").strip()).name if file_col else ""
+            parts = {"name": name, "stem": Path(name).stem}
+            if audio_col:
+                audio_name = (row.get(audio_col) or "").strip()
+            else:
+                audio_name = audio_template.format(**parts) if name else ""
+            if not audio_name:
+                continue
+            audio_path = _local_path(audio_name, root)
+            if not audio_path.is_file():
+                continue
+            if text_col:
+                sentence = (row.get(text_col) or "").strip()
+            else:
+                text_name = text_template.format(**parts) if name else ""
+                if not text_name:
                     continue
-                dataset = load_dataset(ds, config_name, split="test")
-                dataset = dataset.cast_column("audio", Audio(args.sampling_rate))
-                dataset = dataset.rename_column("hanzi", "sentence")
-                dataset = dataset.remove_columns(
-                    set(dataset.features.keys()) - set(["audio", "sentence"])
-                )
+                text_path = _local_path(text_name, root)
+                if not text_path.is_file():
+                    continue
+                sentence = text_path.read_text(encoding="utf-8-sig").strip()
+            if sentence:
+                yield {"audio": {"path": str(audio_path), "bytes": None}, "sentence": sentence}
 
-                dataset = dataset.map(remove_trailing_comma_and_add_dot, num_proc=8)
-                combined_dataset.append(dataset)
 
-    ds_to_return = concatenate_datasets(combined_dataset)
-    ds_to_return = ds_to_return.shuffle(seed=22)
-    return ds_to_return
+def _load_local_csv(cfg):
+    mode = cfg["sample_mode"].strip().lower()
+    if mode == "ratio":
+        # Local CSV split metadata is cheap to count in a first pass.
+        count = sum(1 for _ in _local_rows(cfg, read_content=False))
+        limit = _sample_limit(cfg, count)
+    else:
+        limit = _sample_limit(cfg)
+    records = []
+    for record in _local_rows(cfg):
+        records.append(record)
+        if limit is not None and len(records) >= limit:
+            break
+    return Dataset.from_list(records, features=DATASET_FEATURES)
+
+
+# datasets.map/filter with num_proc=1 still spawns a worker subprocess.
+# None explicitly runs in this process and avoids the Colab/Python 3.13
+# multiprocessing/BytesIO teardown noise seen during the smoke tests.
+DATASET_NUM_PROC = args.num_proc if args.num_proc > 1 else None
+
+
+def load_one_dataset(cfg):
+    source = (cfg["source_type"] or "").strip().lower()
+    if source == "hf":
+        dataset = _load_hf(cfg)
+    elif source == "local_csv":
+        dataset = _load_local_csv(cfg)
+    else:
+        raise ValueError(f"Unknown source_type={source!r}: {cfg}")
+
+    # Shared filtering and conversion. Audio is decoded only here, after taking
+    # a small sample if requested; the original duration filter runs below.
+    dataset = dataset.filter(
+        lambda audio, sentence: audio is not None and bool(sentence and sentence.strip()),
+        input_columns=["audio", "sentence"],
+        num_proc=DATASET_NUM_PROC,
+    )
+    if len(dataset) == 0:
+        raise ValueError(f"Zero usable rows in {cfg['path']}/{cfg['split']}")
+    # Normalize labels before enabling audio decoding/resampling.
+    dataset = dataset.map(remove_trailing_comma_and_add_dot, num_proc=DATASET_NUM_PROC)
+    dataset = dataset.cast_column("audio", Audio(args.sampling_rate))
+    print(f"[{cfg['role']}] {source} {cfg['path']} "
+          f"({cfg.get('config')}/{cfg['split']}): {len(dataset)} rows", flush=True)
+    return dataset
+
+
+def load_all_datasets(role):
+    selected = [cfg for cfg in DATASET_SETTINGS if _enabled(cfg) and cfg["role"] == role]
+    if not selected:
+        raise ValueError(f"No enabled datasets for role={role!r} in {MANIFEST}")
+    combined = [load_one_dataset(cfg) for cfg in selected]
+    return concatenate_datasets(combined).shuffle(seed=22)
 
 
 max_label_length = model.config.max_length
@@ -286,7 +456,7 @@ raw_dataset["eval"] = load_all_datasets("eval")
 raw_dataset = raw_dataset.filter(
     is_in_length_range,
     input_columns=["audio", "sentence"],
-    num_proc=args.num_proc,
+    num_proc=DATASET_NUM_PROC,
 )
 
 ###############################     DATA COLLATOR AND METRIC DEFINITION     ########################
@@ -377,7 +547,8 @@ if args.train_strategy == "epoch":
         # warmup_steps=args.warmup_steps,
         # warmup_ratio=args.warmup_ratio,
         gradient_checkpointing=gradient_checkpointing,
-        bf16=True,
+        bf16=torch.cuda.is_available() and torch.cuda.is_bf16_supported(),
+        fp16=torch.cuda.is_available() and not torch.cuda.is_bf16_supported(),
         eval_strategy="epoch",
         save_strategy="epoch",
         num_train_epochs=args.num_epochs,
@@ -385,8 +556,9 @@ if args.train_strategy == "epoch":
         per_device_eval_batch_size=args.eval_batchsize,
         predict_with_generate=True,
         generation_max_length=225,
-        logging_steps=500,
-        report_to=["wandb"],
+        logging_steps=args.logging_steps,
+        logging_first_step=True,
+        report_to=[] if (args.report_to == "none" or os.environ.get("WHISPER_NO_WANDB")) else ["wandb"],
         load_best_model_at_end=True,
         metric_for_best_model="cer",
         greater_is_better=False,
@@ -394,8 +566,10 @@ if args.train_strategy == "epoch":
         lr_scheduler_type="constant",
         # optim="apollo_adamw",
         # optim_target_modules=[r".*.attn.*", r".*.mlp.*"],
-        resume_from_checkpoint=args.resume_from_ckpt,
-        dataloader_num_workers=16,
+        dataloader_num_workers=(
+            args.dataloader_num_workers if args.dataloader_num_workers is not None
+            else int(os.environ.get("WHISPER_WORKERS", "16"))
+        ),
         max_grad_norm=1.0,
         remove_unused_columns=False,
     )
@@ -409,7 +583,8 @@ elif args.train_strategy == "steps":
         # warmup_steps=args.warmup_steps,
         # warmup_ratio=args.warmup_ratio,
         gradient_checkpointing=gradient_checkpointing,
-        bf16=True,
+        bf16=torch.cuda.is_available() and torch.cuda.is_bf16_supported(),
+        fp16=torch.cuda.is_available() and not torch.cuda.is_bf16_supported(),
         eval_strategy="steps",
         eval_steps=800,
         save_strategy="steps",
@@ -419,15 +594,18 @@ elif args.train_strategy == "steps":
         per_device_eval_batch_size=args.eval_batchsize,
         predict_with_generate=True,
         generation_max_length=225,
-        logging_steps=500,
-        report_to=["wandb"],
+        logging_steps=args.logging_steps,
+        logging_first_step=True,
+        report_to=[] if (args.report_to == "none" or os.environ.get("WHISPER_NO_WANDB")) else ["wandb"],
         load_best_model_at_end=True,
         metric_for_best_model="cer",
         greater_is_better=False,
         optim="schedule_free_adamw",
         lr_scheduler_type="constant",
-        resume_from_checkpoint=args.resume_from_ckpt,
-        dataloader_num_workers=16,
+        dataloader_num_workers=(
+            args.dataloader_num_workers if args.dataloader_num_workers is not None
+            else int(os.environ.get("WHISPER_WORKERS", "16"))
+        ),
     )
 
 trainer = Seq2SeqTrainer(
@@ -443,7 +621,7 @@ trainer = Seq2SeqTrainer(
 processor.save_pretrained(training_args.output_dir)
 
 print("TRAINING IN PROGRESS...")
-trainer.train()
+trainer.train(resume_from_checkpoint=None if args.resume_from_ckpt in (None, "None") else args.resume_from_ckpt)
 print("DONE TRAINING")
 print("DONE TRAINING")
 print("DONE TRAINING")
