@@ -4,6 +4,7 @@ import json
 import math
 import os
 import re
+import signal
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -19,11 +20,14 @@ from datasets import (
     Features,
     Value,
     concatenate_datasets,
+    get_dataset_config_names,
+    get_dataset_split_names,
     load_dataset_builder,
     load_dataset,
 )
 from transformers import (
     Seq2SeqTrainer,
+    TrainerCallback,
     Seq2SeqTrainingArguments,
     WhisperForConditionalGeneration,
     WhisperProcessor,
@@ -150,8 +154,8 @@ parser.add_argument(
     help="Log training loss every N optimizer steps (e.g., 1 for a Colab smoke test).",
 )
 parser.add_argument(
-    "--dataloader_num_workers", type=int, default=None,
-    help="PyTorch DataLoader workers; 0 is useful for Colab (default: 16).",
+    "--dataloader_num_workers", type=int, default=2,
+    help="Per-rank DataLoader workers (default: 2; set 0 for Colab).",
 )
 parser.add_argument(
     "--report_to", choices=["wandb", "none"], default="wandb",
@@ -164,7 +168,7 @@ if args.train_strategy not in ["steps", "epoch"]:
     raise ValueError("The train strategy should be either steps and epoch.")
 if args.num_proc < 1 or args.logging_steps < 1:
     raise ValueError("--num_proc and --logging_steps must be positive integers")
-if args.dataloader_num_workers is not None and args.dataloader_num_workers < 0:
+if args.dataloader_num_workers < 0:
     raise ValueError("--dataloader_num_workers must be >= 0")
 
 print("\n\n+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++\n\n")
@@ -180,6 +184,23 @@ do_normalize_eval = True
 do_lower_case = False
 do_remove_punctuation = False
 normalizer = BasicTextNormalizer()
+
+
+# Slurm can send SIGUSR1 before the time limit. Save on the NEXT optimizer
+# step boundary (not within the signal handler), then exit training cleanly.
+# A SLURM batch-shell SIGUSR1 can touch WHISPER_STOP_FILE instead of signaling
+# torchrun (which might terminate the launcher). Rank sync uses all-reduce.
+_STOP_REQUESTED = False
+
+
+def _request_stop(signum, frame):
+    global _STOP_REQUESTED
+    _STOP_REQUESTED = True
+    print(f"[signal] {signal.Signals(signum).name}: checkpoint requested at next optimizer step", flush=True)
+
+
+for _sig in (signal.SIGUSR1, signal.SIGTERM):
+    signal.signal(_sig, _request_stop)
 
 
 #############################       MODEL LOADING       #####################################
@@ -212,6 +233,10 @@ if freeze_encoder:
 
 model.config.forced_decoder_ids = None
 model.config.suppress_tokens = []
+# Make generated evaluation transcripts use the same language/task as training labels.
+model.generation_config.language = args.language
+model.generation_config.task = "transcribe"
+model.generation_config.forced_decoder_ids = None
 
 if gradient_checkpointing:
     model.config.use_cache = False
@@ -235,7 +260,7 @@ MANIFEST = Path(os.path.expandvars(os.path.expanduser(args.dataset_config_csv)))
 with MANIFEST.open(newline="", encoding="utf-8-sig") as handle:
     DATASET_SETTINGS = list(csv.DictReader(handle))
 
-REQUIRED_COLUMNS = {"role", "source_type", "path", "split", "sample_mode", "sample_value"}
+REQUIRED_COLUMNS = {"role", "source_type", "path", "split", "sample_mode", "sample_value", "config", "opencc"}
 if not DATASET_SETTINGS:
     raise ValueError(f"Empty dataset manifest: {MANIFEST}")
 if not REQUIRED_COLUMNS.issubset(DATASET_SETTINGS[0]):
@@ -244,6 +269,57 @@ if not REQUIRED_COLUMNS.issubset(DATASET_SETTINGS[0]):
 
 def _enabled(cfg):
     return (cfg.get("enabled") or "1").strip().lower() not in {"0", "false", "no", "off"}
+
+
+# A blank/none OpenCC value means no change. Only a single column is needed.
+OPENCC_MODES = {"none", "s2t", "s2tw", "s2twp", "t2s", "tw2s"}
+
+
+def _opencc_mode(cfg):
+    mode = (cfg.get("opencc") or "none").strip().lower()
+    if mode not in OPENCC_MODES:
+        raise ValueError(f"Invalid opencc={mode!r} for {cfg.get('path')}")
+    return mode
+
+
+@lru_cache(maxsize=None)
+def _converter(mode):
+    try:
+        from opencc import OpenCC
+    except ImportError as exc:
+        raise ImportError("CSV requests OpenCC; install it in this Python environment: uv pip install --python .venv/bin/python opencc") from exc
+    return OpenCC(mode)
+
+
+def _apply_opencc(row, mode):
+    return {"sentence": _converter(mode).convert(row["sentence"])}
+
+
+@lru_cache(maxsize=None)
+def _hf_configs(repo):
+    return get_dataset_config_names(repo)
+
+
+@lru_cache(maxsize=None)
+def _hf_splits(repo, config):
+    return get_dataset_split_names(repo, config)
+
+
+def _expand_configs(cfg):
+    """config=* discovers all HF configs, keeping only those with this split."""
+    if (cfg.get("source_type") or "").strip().lower() != "hf" or (cfg.get("config") or "").strip() != "*":
+        return [cfg]
+
+    expanded = []
+    for config in _hf_configs(cfg["path"]):
+        if cfg["split"] not in _hf_splits(cfg["path"], config):
+            print(f"[config=*] skip {cfg['path']}/{config}: no {cfg['split']} split", flush=True)
+            continue
+        expanded.append({**cfg, "config": config})
+    if not expanded:
+        raise ValueError(f"No config in {cfg['path']} has split={cfg['split']}")
+    print(f"[config=*] {cfg['path']} {cfg['split']} -> {[x['config'] for x in expanded]}", flush=True)
+    return expanded
 
 
 def _local_path(value, base):
@@ -418,6 +494,12 @@ def load_one_dataset(cfg):
     )
     if len(dataset) == 0:
         raise ValueError(f"Zero usable rows in {cfg['path']}/{cfg['split']}")
+    # Apply text conversion per CSV source before punctuation normalization.
+    opencc_mode = _opencc_mode(cfg)
+    if opencc_mode != "none":
+        dataset = dataset.map(
+            _apply_opencc, fn_kwargs={"mode": opencc_mode}, num_proc=DATASET_NUM_PROC
+        )
     # Normalize labels before enabling audio decoding/resampling.
     dataset = dataset.map(remove_trailing_comma_and_add_dot, num_proc=DATASET_NUM_PROC)
     dataset = dataset.cast_column("audio", Audio(args.sampling_rate))
@@ -430,7 +512,8 @@ def load_all_datasets(role):
     selected = [cfg for cfg in DATASET_SETTINGS if _enabled(cfg) and cfg["role"] == role]
     if not selected:
         raise ValueError(f"No enabled datasets for role={role!r} in {MANIFEST}")
-    combined = [load_one_dataset(cfg) for cfg in selected]
+    expanded = [item for cfg in selected for item in _expand_configs(cfg)]
+    combined = [load_one_dataset(cfg) for cfg in expanded]
     return concatenate_datasets(combined).shuffle(seed=22)
 
 
@@ -487,8 +570,11 @@ class DataCollatorSpeechSeq2SeqWithPadding:
         if do_remove_punctuation and normalizer is not None:
             sentences = [normalizer(s).strip() for s in sentences]
 
-        # Remove spaces from sentences if needed
-        sentences = [s.replace(" ", "") for s in sentences]
+        # Collapse spaces between CJK characters only; preserve English word breaks.
+        sentences = [
+            re.sub(r"(?<=[\u3400-\u9fff]) +(?=[\u3400-\u9fff])", "", s)
+            for s in sentences
+        ]
 
         labels_batch = self.processor.tokenizer(
             sentences, padding=True, return_tensors="pt"
@@ -566,10 +652,7 @@ if args.train_strategy == "epoch":
         lr_scheduler_type="constant",
         # optim="apollo_adamw",
         # optim_target_modules=[r".*.attn.*", r".*.mlp.*"],
-        dataloader_num_workers=(
-            args.dataloader_num_workers if args.dataloader_num_workers is not None
-            else int(os.environ.get("WHISPER_WORKERS", "16"))
-        ),
+        dataloader_num_workers=args.dataloader_num_workers,
         max_grad_norm=1.0,
         remove_unused_columns=False,
     )
@@ -602,11 +685,26 @@ elif args.train_strategy == "steps":
         greater_is_better=False,
         optim="schedule_free_adamw",
         lr_scheduler_type="constant",
-        dataloader_num_workers=(
-            args.dataloader_num_workers if args.dataloader_num_workers is not None
-            else int(os.environ.get("WHISPER_WORKERS", "16"))
-        ),
+        dataloader_num_workers=args.dataloader_num_workers,
     )
+
+class SaveOnSignalCallback(TrainerCallback):
+    def on_step_end(self, args, state, control, **kwargs):
+        stop_file = os.environ.get("WHISPER_STOP_FILE")
+        requested = _STOP_REQUESTED or (bool(stop_file) and Path(stop_file).exists())
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            backend = torch.distributed.get_backend()
+            device = torch.device("cuda", torch.cuda.current_device()) if backend == "nccl" else torch.device("cpu")
+            flag = torch.tensor([int(requested)], device=device)
+            torch.distributed.all_reduce(flag, op=torch.distributed.ReduceOp.MAX)
+            requested = bool(flag.item())
+        if requested:
+            control.should_save = True
+            control.should_training_stop = True
+            if state.is_world_process_zero:
+                print(f"[signal] Saving checkpoint at global_step={state.global_step} and stopping", flush=True)
+        return control
+
 
 trainer = Seq2SeqTrainer(
     args=training_args,
@@ -615,6 +713,7 @@ trainer = Seq2SeqTrainer(
     eval_dataset=raw_dataset["eval"],
     data_collator=data_collator,
     compute_metrics=compute_metrics,
+    callbacks=[SaveOnSignalCallback()],
     tokenizer=processor.feature_extractor,
 )
 
