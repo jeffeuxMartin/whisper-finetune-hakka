@@ -8,6 +8,7 @@ dependencies = [
     "datasets>=4.0.0",
     "evaluate>=0.4.5",
     "jiwer>=4.0.0",
+    "opencc>=1.4.2",
     "schedulefree>=1.4.1",
     "soundfile>=0.13.1",
     "torch>=2.8.0",
